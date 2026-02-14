@@ -256,8 +256,10 @@ loop {
 **connect() 详细流程**:
 ```
 1. 从 tag 中 downcast 获取 KcpLinkTag
-2. KcpStream::connect(tag.remote, self.kcp_config.clone()).await?
-   → 注意: kcp-tokio 的 connect 返回 kcp_tokio::Result，需转换为 std::io::Result
+2. let stream = KcpStream::connect(tag.remote, self.kcp_config.clone())
+       .await
+       .map_err(|e| std::io::Error::other(e))?;
+   → 注意: KcpError 没有实现 Into<io::Error>，必须使用 map_err 显式转换
 3. let (rh, wh) = tokio::io::split(stream)
 4. Ok(IoBox::new(rh, wh).into())
 ```
@@ -288,8 +290,10 @@ pub struct KcpAcceptor {
 
 **listen() 详细流程**:
 ```
-1. let mut listener = KcpListener::bind(self.bind_addr, self.kcp_config.clone()).await?
-   → 注意: 需将 kcp_tokio::Result 转为 std::io::Result
+1. let mut listener = KcpListener::bind(self.bind_addr, self.kcp_config.clone())
+       .await
+       .map_err(|e| std::io::Error::other(e))?;
+   → 注意: KcpError → io::Error 必须 map_err，不能直接用 ?
 2. loop {
        let (stream, remote_addr) = listener.accept().await?
        let tag = KcpLinkTag { remote: remote_addr, direction: Incoming }
@@ -360,7 +364,7 @@ kcp: Option<u16>,
 ```rust
 // 在 ClientCli::run() 中
 let kcp_connector = if !self.kcp.is_empty() {
-    let kcp_config = KcpConfig::new().fast_mode();
+    let kcp_config = KcpConfig::new().fast_mode().stream_mode(true).keep_alive(None);
     match KcpConnector::new(self.kcp.clone(), KCP_DEFAULT_PORT, kcp_config).await {
         Ok(kcp) => {
             targets.push(format!("KCP {kcp}"));
@@ -387,20 +391,24 @@ if let Some(c) = kcp_connector.clone() {
 ```rust
 // 在 ServerCli::run() 中
 if let Some(port) = self.kcp {
-    let kcp_config = KcpConfig::new().fast_mode();
-    let kcp_acceptor = KcpAcceptor::new(
-        SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), port),
-        kcp_config,
-    );
-    server_ports.push(format!("KCP :{port}"));
-    acceptor.add(kcp_acceptor);
+    let bind_addr = SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), port);
+    // 预检查: 验证 UDP 端口是否可用
+    match tokio::net::UdpSocket::bind(bind_addr).await {
+        Ok(_) => {
+            let kcp_config = KcpConfig::new().fast_mode().stream_mode(true).keep_alive(None);
+            let kcp_acceptor = KcpAcceptor::new(bind_addr, kcp_config);
+            server_ports.push(format!("KCP :{port}"));
+            acceptor.add(kcp_acceptor);
+        }
+        Err(err) => eprintln!("Cannot listen on KCP port {port}: {err}"),
+    }
 }
 ```
 
 ### 5.6 常量定义
 
 ```rust
-const KCP_DEFAULT_PORT: u16 = 5800; // 与 TCP 保持一致，或使用不同端口
+const KCP_DEFAULT_PORT: u16 = 5801; // 与 TCP (5800) 区分，避免用户混淆
 ```
 
 ---
@@ -603,11 +611,140 @@ cargo run --bin agg-tunnel -- client --tcp 127.0.0.1:5800 --kcp 127.0.0.1:5801 -
 
 ---
 
-## 10. 注意事项
+## 10. 文档审查: 已发现的问题与修正
+
+> 以下是对本文档进行自审后发现的问题，按严重程度排序。
+> 实施时务必按修正方案处理。
+
+### 10.1 [严重] stream_mode 未在代码示例中启用
+
+**问题**: 文档中所有代码示例使用 `KcpConfig::new().fast_mode()`，但查看 kcp-tokio 源码:
+- `KcpConfig::default()` 中 `stream_mode: false`
+- `fast_mode()` 仅修改 `nodelay` 参数，**不会启用 stream_mode**
+
+`stream_mode = false` 时，KCP 按消息模式工作，每次 `send` 是独立消息包。而 Aggligator 的 `IntegrityCodec` 将数据作为连续字节流处理（通过 `AsyncRead`/`AsyncWrite`），如果 KCP 不启用 stream_mode，可能导致数据边界不对齐，影响 codec 解帧。
+
+**修正**: 所有构建 `KcpConfig` 的地方必须显式启用 stream_mode:
+```rust
+let kcp_config = KcpConfig::new().fast_mode().stream_mode(true);
+```
+
+### 10.2 [严重] KcpError 到 std::io::Error 的转换方向
+
+**问题**: 文档 4.6 节的错误转换描述不够精确。查看 kcp-tokio 源码:
+- `KcpError` 实现了 `From<std::io::Error>` (io::Error → KcpError) ✓
+- `KcpError` **没有**实现 `Into<std::io::Error>` (KcpError → io::Error) ✗
+- `KcpError` 通过 `thiserror` 实现了 `std::error::Error + Display`
+
+因此在 `connect()` 和 `listen()` 中不能直接使用 `?` 算子将 `kcp_tokio::Result` 转换为 `std::io::Result`。
+
+**修正**: 必须使用 `map_err` 显式转换:
+```rust
+let stream = KcpStream::connect(addr, config)
+    .await
+    .map_err(|e| std::io::Error::other(e.to_string()))?;
+```
+`Error::other()` 接受 `impl Into<Box<dyn Error + Send + Sync>>`，`KcpError` 实现了 `Error`，所以也可以:
+```rust
+    .map_err(|e| std::io::Error::other(e))?;
+```
+
+### 10.3 [中等] KcpAcceptor 延迟绑定 — 与 TCP 行为不一致
+
+**问题**: 文档设计 `KcpAcceptor::new()` 为同步、不可失败方法（仅保存地址），绑定推迟到 `listen()` 中。
+但 `TcpAcceptor::new()` 是 async 且立即绑定端口，如果端口被占用会在启动时立即报错。
+
+当前 KCP 方案下，端口被占用的错误只会在 `listen()` 被框架调用时出现（延迟报错），用户的服务端启动时看不到明确的绑定失败提示。
+
+**根本原因**: `KcpListener::accept(&mut self)` 需要 `&mut self`，而 `AcceptingTransport::listen(&self, ...)` 接收 `&self`。如果预先绑定并存储 `KcpListener`，需要 `Mutex` 包装。
+
+**修正方案 (推荐)**: 保持当前延迟绑定设计（避免 Mutex开销），但在 agg-tunnel 集成时做预检查:
+```rust
+if let Some(port) = self.kcp {
+    let bind_addr = SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), port);
+    // 预检查: 尝试绑定 UDP 端口验证可用性
+    match tokio::net::UdpSocket::bind(bind_addr).await {
+        Ok(_) => {
+            let kcp_config = KcpConfig::new().fast_mode().stream_mode(true);
+            let kcp_acceptor = KcpAcceptor::new(bind_addr, kcp_config);
+            server_ports.push(format!("KCP :{port}"));
+            acceptor.add(kcp_acceptor);
+        }
+        Err(err) => eprintln!("Cannot listen on KCP port {port}: {err}"),
+    }
+}
+```
+
+### 10.4 [中等] tokio::io::split 的性能开销
+
+**问题**: TCP transport 使用 `TcpStream::into_split()`，返回的 `OwnedReadHalf`/`OwnedWriteHalf` 无锁、零开销，因为读写由 OS 独立管理。
+
+而 KCP 必须使用 `tokio::io::split()` (因为 `KcpStream` 没有 `into_split`)，其内部使用 `Arc<Mutex<KcpStream>>`，读写操作会互相竞争锁。在高吞吐场景下可能成为瓶颈。
+
+**影响评估**: Aggligator 的 IntegrityCodec 对每个链路的读写是交替进行的（非高并发），锁竞争通常不大。但在极端情况下可能有影响。
+
+**修正**: 当前方案可接受，但应在文档中标注。未来可考虑:
+- 向 kcp-tokio 提 PR 添加 `into_split()` 方法
+- 自行封装无锁读写分离（如果 kcp-tokio 内部支持）
+
+### 10.5 [中等] KCP 与 Aggligator 双重 keep-alive 冗余
+
+**问题**: KCP 有自己的 keep-alive 机制 (`KcpConfig.keep_alive`，默认 30s)，Aggligator 也有连接级别的 keep-alive/心跳。两者同时运行会产生冗余的网络流量。
+
+**修正**: 禁用 KCP 层的 keep-alive，让 Aggligator 管理连接活性:
+```rust
+let kcp_config = KcpConfig::new()
+    .fast_mode()
+    .stream_mode(true)
+    .keep_alive(None);  // 禁用 KCP keep-alive
+```
+
+### 10.6 [轻微] 默认端口与 TCP 冲突
+
+**问题**: `KCP_DEFAULT_PORT = 5800` 与 `TCP_PORT = 5800` 相同。虽然 UDP/TCP 的端口命名空间在 OS 层面独立（不会真正冲突），但用户在命令行使用时容易混淆（"我是连的 TCP 还是 KCP？"）。
+
+**修正**: 使用不同的默认端口:
+```rust
+const KCP_DEFAULT_PORT: u16 = 5801;
+```
+
+### 10.7 [轻微] 主机名端口拼接逻辑未显式展示
+
+**问题**: TCP connector 在 `new()` / `unresolved()` 中对不含端口号的主机名追加默认端口:
+```rust
+for host in &mut hosts {
+    if !host.contains(':') {
+        host.push_str(&format!(":{default_port}"));
+    }
+}
+```
+文档的 `KcpConnector::new()` 提到接受 `default_port` 参数，但没有显式展示这段逻辑。
+
+**修正**: 实现时需包含相同的端口拼接逻辑。
+
+### 10.8 [轻微] 缺少 KCP 连接重连行为说明
+
+**问题**: 当一条 KCP 链路断开时, Aggligator 框架会调用 `connect()` 尝试重连。每次重连都会创建全新的 `KcpStream`（新的 UDP socket + 新的 KCP conversation ID）。这与 TCP 的重连行为一致——但 KCP 每次重连的 UDP 源端口可能不同，服务端的 `KcpListener` 需要能接受来自不同源端口的新连接。
+
+**影响**: `KcpListener` 天然支持接受多个独立连接（不同 conv_id），所以这不是问题。但值得在设计中显式确认。
+
+### 10.9 [轻微] IntegrityCodec 与 KCP 双重可靠性
+
+**问题**: Aggligator 的 `IntegrityCodec` 在 IO stream 上添加帧头 + CRC32 校验。KCP 本身已经提供可靠传输和数据完整性保证。两层一起使用有冗余。
+
+**影响**: 这与 TCP transport 的行为一致（TCP 也有可靠传输，仍然使用 IntegrityCodec）。IntegrityCodec 的主要作用是帧分界（length-prefix framing），不仅仅是校验。所以冗余是可接受的。
+
+**修正**: 无需修改，与项目现有设计一致。
+
+---
+
+## 11. 注意事项
 
 1. **kcp-tokio 版本锁定**: 使用 `0.4.0` 版本，API 可能在未来版本变化
-2. **UDP 端口冲突**: KCP 和 TCP 使用不同的默认端口或通过 CLI 指定不同端口
+2. **UDP 端口冲突**: KCP 和 TCP 使用不同的默认端口，建议 KCP 用 5801
 3. **防火墙**: KCP 使用 UDP，需确保防火墙允许 UDP 流量
 4. **NAT 穿透**: KCP/UDP 的 NAT 穿透行为与 TCP 不同，可能需要注意
-5. **stream_mode**: KCP 的 `stream_mode` 默认应启用 (`true`)，以便与 Aggligator 的流式 IO 模型兼容
+5. **stream_mode**: 必须显式启用 `stream_mode(true)`
 6. **tokio feature**: 需要 `tokio` 的 `io-util` feature (用于 `tokio::io::split`)
+7. **keep_alive**: 应禁用 KCP 层 keep-alive `keep_alive(None)`，避免与 Aggligator 冗余
+8. **KcpConfig 最终构建**: `KcpConfig::new().fast_mode().stream_mode(true).keep_alive(None)`
