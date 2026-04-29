@@ -3,6 +3,17 @@ members = [
     "aggligator",
     "aggligator-monitor",
     "aggligator-transport-bluer",
+    "aggligator-transport-kcp",
+    "aggligator-transport-tcp",
+    "aggligator-transport-usb",
+    "aggligator-transport-websocket",
+    "aggligator-util",
+    "aggligator-wrapper-tls",
+]
+default-members = [
+    "aggligator",
+    "aggligator-monitor",
+    "aggligator-transport-kcp",
     "aggligator-transport-tcp",
     "aggligator-transport-usb",
     "aggligator-transport-websocket",

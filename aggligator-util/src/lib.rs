@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use aggligator::cfg::Cfg;
+use aggligator_transport_kcp::KcpLinkFilter;
 use aggligator_transport_tcp::TcpLinkFilter;
 
 /// Initializes logging for command line utilities.
@@ -45,6 +46,16 @@ pub fn parse_tcp_link_filter(s: &str) -> anyhow::Result<TcpLinkFilter> {
         "interface-interface" => Ok(TcpLinkFilter::InterfaceInterface),
         "interface-ip" => Ok(TcpLinkFilter::InterfaceIp),
         other => bail!("unknown TCP link filter: {other}"),
+    }
+}
+
+/// Parse [KcpLinkFilter] option.
+pub fn parse_kcp_link_filter(s: &str) -> anyhow::Result<KcpLinkFilter> {
+    match s {
+        "none" => Ok(KcpLinkFilter::None),
+        "interface-interface" => Ok(KcpLinkFilter::InterfaceInterface),
+        "interface-ip" => Ok(KcpLinkFilter::InterfaceIp),
+        other => bail!("unknown KCP link filter: {other}"),
     }
 }
 

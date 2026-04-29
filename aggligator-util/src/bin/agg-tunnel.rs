@@ -31,8 +31,9 @@ use aggligator::{
     transport::{AcceptorBuilder, ConnectingTransport, ConnectorBuilder, LinkTagBox},
 };
 use aggligator_monitor::monitor::{interactive_monitor, watch_tags};
+use aggligator_transport_kcp::{KcpAcceptor, KcpConfig, KcpConnector, KcpLinkFilter};
 use aggligator_transport_tcp::{IpVersion, TcpAcceptor, TcpConnector, TcpLinkFilter};
-use aggligator_util::{init_log, load_cfg, parse_tcp_link_filter, print_default_cfg, wait_sigterm};
+use aggligator_util::{init_log, load_cfg, parse_kcp_link_filter, parse_tcp_link_filter, print_default_cfg, wait_sigterm};
 
 #[cfg(feature = "bluer")]
 use aggligator_transport_bluer::rfcomm::{RfcommAcceptor, RfcommConnector};
@@ -41,6 +42,7 @@ use aggligator_transport_bluer::rfcomm::{RfcommAcceptor, RfcommConnector};
 use aggligator_transport_usb::{upc, usb_gadget};
 
 const TCP_PORT: u16 = 5800;
+const KCP_DEFAULT_PORT: u16 = 5801;
 const FLUSH_DELAY: Option<Duration> = Some(Duration::from_millis(10));
 const DUMP_BUFFER: usize = 8192;
 
@@ -151,6 +153,25 @@ pub struct ClientCli {
     /// TCP server name or IP addresses and port number.
     #[arg(long)]
     tcp: Vec<String>,
+    /// KCP server address (host:port or IP:port).
+    #[arg(long)]
+    kcp: Vec<String>,
+    /// Enable FEC (Forward Error Correction) for KCP with format "data:parity".
+    ///
+    /// For example, "3:1" means 3 data shards and 1 parity shard per FEC block.
+    /// This adds ~33% bandwidth overhead but can recover 1 lost packet per block
+    /// without retransmission.
+    #[cfg(feature = "fec")]
+    #[arg(long, value_parser = parse_fec_config)]
+    kcp_fec: Option<aggligator_transport_kcp::fec::FecConfig>,
+    /// Enable Phantun fake-TCP disguise for KCP traffic.
+    ///
+    /// Wraps KCP/UDP datagrams in fake TCP headers using a TUN interface,
+    /// allowing traffic to traverse firewalls that block UDP.
+    /// Requires root/admin privileges to create TUN interfaces.
+    #[cfg(feature = "phantun")]
+    #[arg(long)]
+    kcp_phantun: bool,
     /// TCP link filter.
     ///
     /// none: no link filtering.
@@ -160,6 +181,15 @@ pub struct ClientCli {
     /// interface-ip: one link for each pair of local interface and remote IP address.
     #[arg(long, value_parser = parse_tcp_link_filter, default_value = "interface-interface")]
     tcp_link_filter: TcpLinkFilter,
+    /// KCP link filter.
+    ///
+    /// none: no link filtering.
+    ///
+    /// interface-interface: one link for each pair of local and remote interface.
+    ///
+    /// interface-ip: one link for each pair of local interface and remote IP address.
+    #[arg(long, value_parser = parse_kcp_link_filter, default_value = "interface-interface")]
+    kcp_link_filter: KcpLinkFilter,
     /// Bluetooth RFCOMM server address.
     #[cfg(feature = "bluer")]
     #[arg(long)]
@@ -198,6 +228,39 @@ impl ClientCli {
                 }
                 Err(err) => {
                     eprintln!("cannot use TCP target: {err}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let kcp_connector = if !self.kcp.is_empty() {
+            let kcp_config = KcpConfig::new().fast_mode().stream_mode(true).keep_alive(None);
+            match KcpConnector::new(self.kcp.clone(), KCP_DEFAULT_PORT, kcp_config).await {
+                Ok(kcp) => {
+                    let mut kcp = kcp;
+                    kcp.set_ip_version(
+                        aggligator_transport_kcp::IpVersion::from_only(self.ipv4, self.ipv6)
+                            .map_err(|e| anyhow::anyhow!(e))?,
+                    );
+                    kcp.set_link_filter(self.kcp_link_filter);
+                    #[cfg(feature = "fec")]
+                    if let Some(fec_cfg) = self.kcp_fec.clone() {
+                        kcp.set_fec(fec_cfg);
+                    }
+                    #[cfg(feature = "phantun")]
+                    if self.kcp_phantun {
+                        kcp.set_phantun(
+                            aggligator_transport_kcp::phantun::PhantunConfig::client_default(),
+                        )?;
+                    }
+                    targets.push(format!("KCP {kcp}"));
+                    watch_conn.push(Box::new(kcp.clone()));
+                    Some(kcp)
+                }
+                Err(err) => {
+                    eprintln!("cannot use KCP target: {err}");
                     None
                 }
             }
@@ -296,6 +359,7 @@ impl ClientCli {
             let disabled_tags_rx = disabled_tags_rx.clone();
             let port_cfg = cfg.clone();
             let tcp_connector = tcp_connector.clone();
+            let kcp_connector = kcp_connector.clone();
             #[cfg(feature = "bluer")]
             let rfcomm_connector = rfcomm_connector.clone();
             #[cfg(feature = "usb-host")]
@@ -317,6 +381,9 @@ impl ClientCli {
 
                     let mut connector = builder.build();
                     if let Some(c) = tcp_connector.clone() {
+                        connector.add(c);
+                    }
+                    if let Some(c) = kcp_connector.clone() {
                         connector.add(c);
                     }
                     #[cfg(feature = "bluer")]
@@ -432,6 +499,27 @@ pub struct ServerCli {
     /// TCP port to listen on.
     #[arg(long)]
     tcp: Option<u16>,
+    /// KCP address(es) to listen on. Can be specified multiple times.
+    ///
+    /// Takes the form `port` or `address:port`. If only a port is specified,
+    /// listens on all interfaces (both IPv4 and IPv6).
+    #[arg(long)]
+    kcp: Vec<String>,
+    /// Enable FEC (Forward Error Correction) for KCP with format "data:parity".
+    ///
+    /// For example, "3:1" means 3 data shards and 1 parity shard per FEC block.
+    /// Must match the client's FEC configuration.
+    #[cfg(feature = "fec")]
+    #[arg(long, value_parser = parse_fec_config)]
+    kcp_fec: Option<aggligator_transport_kcp::fec::FecConfig>,
+    /// Enable Phantun fake-TCP disguise for KCP traffic.
+    ///
+    /// Listens for incoming fake-TCP connections through a TUN interface
+    /// instead of a UDP socket. Requires root/admin privileges to create
+    /// TUN interfaces.
+    #[cfg(feature = "phantun")]
+    #[arg(long)]
+    kcp_phantun: bool,
     /// RFCOMM channel number to listen on.
     #[cfg(feature = "bluer")]
     #[arg(long)]
@@ -484,6 +572,70 @@ impl ServerCli {
                     acceptor.add(tcp);
                 }
                 Err(err) => eprintln!("Cannot listen on TCP port {port}: {err}"),
+            }
+        }
+
+        for kcp_entry in &self.kcp {
+            let kcp_config = KcpConfig::new().fast_mode().stream_mode(true).keep_alive(None);
+            let mut kcp_bound = false;
+
+            let make_acceptor = |bind_addr: SocketAddr| {
+                let mut acc = KcpAcceptor::new(bind_addr, kcp_config.clone());
+                #[cfg(feature = "fec")]
+                if let Some(fec_cfg) = &self.kcp_fec {
+                    acc.set_fec(fec_cfg.clone());
+                }
+                #[cfg(feature = "phantun")]
+                if self.kcp_phantun {
+                    acc.set_phantun(
+                        aggligator_transport_kcp::phantun::PhantunConfig::server_default(),
+                    );
+                }
+                let _ = &mut acc;
+                acc
+            };
+
+            // Parse entry as either "port" or "address:port".
+            if let Ok(addr) = kcp_entry.parse::<SocketAddr>() {
+                // Explicit address:port — bind to that specific address.
+                match tokio::net::UdpSocket::bind(addr).await {
+                    Ok(_) => {
+                        acceptor.add(make_acceptor(addr));
+                        kcp_bound = true;
+                    }
+                    Err(err) => eprintln!("Cannot listen on KCP {addr}: {err}"),
+                }
+            } else if let Ok(port) = kcp_entry.parse::<u16>() {
+                // Port only — bind on all interfaces (IPv6 + IPv4).
+                let bind_v6 = SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), port);
+                match tokio::net::UdpSocket::bind(bind_v6).await {
+                    Ok(_) => {
+                        acceptor.add(make_acceptor(bind_v6));
+                        kcp_bound = true;
+                    }
+                    Err(err) => tracing::warn!("Cannot bind KCP on {bind_v6}: {err}"),
+                }
+
+                // Bind IPv4 (needed on macOS where IPv6 socket does not accept IPv4).
+                let bind_v4 = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port);
+                match tokio::net::UdpSocket::bind(bind_v4).await {
+                    Ok(_) => {
+                        acceptor.add(make_acceptor(bind_v4));
+                        kcp_bound = true;
+                    }
+                    // On Linux dual-stack, IPv4 bind may fail since IPv6 already covers it.
+                    Err(_) if kcp_bound => {}
+                    Err(err) => eprintln!("Cannot listen on KCP port {port}: {err}"),
+                }
+            } else {
+                eprintln!("Invalid KCP listen address: {kcp_entry} (expected port or address:port)");
+                continue;
+            }
+
+            if kcp_bound {
+                server_ports.push(format!("KCP {kcp_entry}"));
+            } else {
+                eprintln!("Cannot listen on KCP {kcp_entry}");
             }
         }
 
@@ -692,4 +844,23 @@ where
         Some(pos) => Ok((s[..pos].parse()?, s[pos + 1..].parse()?)),
         None => Ok((Default::default(), s.parse()?)),
     }
+}
+
+/// Parse FEC configuration from "data:parity" string (e.g. "3:1").
+#[cfg(feature = "fec")]
+fn parse_fec_config(
+    s: &str,
+) -> std::result::Result<aggligator_transport_kcp::fec::FecConfig, Box<dyn std::error::Error + Send + Sync + 'static>>
+{
+    let (data_str, parity_str) =
+        s.split_once(':').ok_or("expected format 'data:parity' (e.g. '3:1')")?;
+    let data: usize = data_str.parse().map_err(|_| "invalid data_shards number")?;
+    let parity: usize = parity_str.parse().map_err(|_| "invalid parity_shards number")?;
+    if data == 0 {
+        return Err("data_shards must be > 0".into());
+    }
+    if parity == 0 {
+        return Err("parity_shards must be > 0".into());
+    }
+    Ok(aggligator_transport_kcp::fec::FecConfig::new(data, parity))
 }
