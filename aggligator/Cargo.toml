@@ -1,6 +1,6 @@
 [package]
 name = "aggligator"
-version = "0.9.9"
+version = "0.9.11"
 description = "Aggregates multiple links (TCP or similar) into one connection having their combined bandwidth and provides resiliency against failure of individual links."
 categories = ["asynchronous", "network-programming"]
 keywords = ["aggligator", "multi-link", "multipath", "connection", "resilient"]
@@ -27,11 +27,9 @@ async-trait = { workspace = true }
 atomic_refcell = { workspace = true }
 byteorder = { workspace = true }
 bytes = { workspace = true }
-crc32fast = { workspace = true }
+crc-fast = { workspace = true }
 futures = { workspace = true }
 rand = { workspace = true }
-rand_core = { workspace = true }
-rand_xoshiro = { workspace = true }
 tokio = { workspace = true, features = ["rt", "time", "macros"] }
 tokio-stream = { workspace = true, features = ["sync"] }
 tokio-util = { workspace = true, features = ["codec"] }

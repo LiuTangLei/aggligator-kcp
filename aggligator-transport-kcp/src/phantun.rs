@@ -591,7 +591,7 @@ impl FtcpStack {
     }
 
     async fn connect(&mut self, addr: SocketAddr) -> Option<FtcpSocket> {
-        let mut rng = SmallRng::from_os_rng();
+        let mut rng = SmallRng::try_from_rng(&mut rand::rngs::SysRng).expect("OS RNG failure");
         for local_port in rng.random_range(32768..=60999)..=60999 {
             let local_addr = SocketAddr::new(
                 if addr.is_ipv4() {

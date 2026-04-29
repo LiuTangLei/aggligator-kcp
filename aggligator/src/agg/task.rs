@@ -5,8 +5,7 @@ use bytes::Bytes;
 use futures::{
     future, future::BoxFuture, stream, stream::FuturesUnordered, Future, FutureExt, Sink, Stream, StreamExt,
 };
-use rand::prelude::*;
-use rand_xoshiro::SplitMix64;
+use rand::{prelude::*, rngs::SmallRng};
 use std::{
     collections::{HashSet, VecDeque},
     error::Error,
@@ -410,7 +409,7 @@ where
 
         let mut stat_timers = stream::select_all(self.cfg.stats_intervals.iter().map(|t| interval_stream(*t)));
 
-        let mut fast_rng = SplitMix64::seed_from_u64(1);
+        let mut fast_rng = SmallRng::seed_from_u64(1);
 
         // Termination reasons when exiting main loop.
         let read_term;

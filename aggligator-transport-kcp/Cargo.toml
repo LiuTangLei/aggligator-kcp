@@ -17,7 +17,7 @@ fec = ["dep:reed-solomon-erasure"]
 phantun = ["dep:tun2", "dep:pnet", "dep:internet-checksum", "dep:bytes", "dep:rand", "dep:flume"]
 
 [dependencies]
-aggligator = { version = "0.9.7", path = "../aggligator" }
+aggligator = { version = "0.9.11", path = "../aggligator" }
 
 async-trait = { workspace = true }
 tracing = { workspace = true }
@@ -29,8 +29,8 @@ reed-solomon-erasure = { version = "6.0", optional = true }
 tun2 = { version = "4", features = ["async"], optional = true }
 pnet = { version = "0.35", optional = true }
 internet-checksum = { version = "0.2", optional = true }
-bytes = { version = "1", optional = true }
-rand = { version = "0.9", features = ["small_rng"], optional = true }
+bytes = { workspace = true, optional = true }
+rand = { workspace = true, features = ["sys_rng"], optional = true }
 flume = { version = "0.12", optional = true }
 
 [package.metadata.docs.rs]
