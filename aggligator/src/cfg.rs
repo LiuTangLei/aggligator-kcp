@@ -22,6 +22,20 @@ pub enum LinkPing {
     WhenTimedOut,
 }
 
+/// Aggregate-layer redundancy mode.
+#[cfg_attr(feature = "dump", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum AggMode {
+    /// Send each sequence on one primary link unless normal retransmission is required.
+    #[default]
+    Bandwidth,
+    /// Send primaries for throughput and use delayed hedge copies within budget.
+    BandwidthRedundant,
+    /// Send each sequence on one primary link and hedge delayed data on another link within budget.
+    LowLatency,
+}
+
 /// Configuration of a connection consisting of aggregated links.
 ///
 /// For most use cases the default configuration, i.e. [`Cfg::default()`](Self::default),
@@ -47,6 +61,21 @@ pub struct Cfg {
     pub recv_buffer: NonZeroU32,
     /// Length of queue for received data packets.
     pub recv_queue: NonZeroUsize,
+    /// Aggregate-layer redundancy mode.
+    pub agg_mode: AggMode,
+    /// Maximum redundant data overhead in percent for [`AggMode::LowLatency`] and
+    /// [`AggMode::BandwidthRedundant`].
+    pub max_redundancy_overhead_percent: u32,
+    /// Minimum delay before sending a hedge copy.
+    pub hedge_delay_min: Duration,
+    /// Factor used to calculate hedge delay from link roundtrip.
+    ///
+    /// Delay is current roundtrip multiplied by this percent, clamped between
+    /// [`hedge_delay_min`](Self::hedge_delay_min) and
+    /// [`hedge_delay_max`](Self::hedge_delay_max).
+    pub hedge_delay_roundtrip_percent: NonZeroU32,
+    /// Maximum delay before sending a hedge copy.
+    pub hedge_delay_max: Duration,
     /// Minimum timeout waiting for a packet to be acknowledged.
     pub link_ack_timeout_min: Duration,
     /// Factor to calculate acknowledgement timeout from roundtrip time.
@@ -98,6 +127,11 @@ impl Default for Cfg {
             send_queue: NonZeroUsize::new(1024).unwrap(),
             recv_buffer: NonZeroU32::new(67_108_864).unwrap(),
             recv_queue: NonZeroUsize::new(1024).unwrap(),
+            agg_mode: AggMode::Bandwidth,
+            max_redundancy_overhead_percent: 10,
+            hedge_delay_min: Duration::from_millis(5),
+            hedge_delay_roundtrip_percent: NonZeroU32::new(125).unwrap(),
+            hedge_delay_max: Duration::from_millis(30),
             link_ack_timeout_min: Duration::from_secs(1),
             link_ack_timeout_roundtrip_factor: NonZeroU32::new(5).unwrap(),
             link_ack_timeout_max: Duration::from_secs(30),

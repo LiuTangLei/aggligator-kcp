@@ -7,6 +7,7 @@ use futures::{
 };
 use rand::{prelude::*, rngs::SmallRng};
 use std::{
+    cmp::Reverse,
     collections::{HashSet, VecDeque},
     error::Error,
     fmt,
@@ -26,7 +27,7 @@ use tokio::{
 use crate::{
     agg::link_int::{DisconnectInitiator, LinkInt, LinkIntEvent, LinkTest},
     alc::{RecvError, SendError},
-    cfg::{Cfg, ExchangedCfg, LinkPing},
+    cfg::{AggMode, Cfg, ExchangedCfg, LinkPing},
     control::{Direction, DisconnectReason, Link, NotWorkingReason, Stats},
     exec::time::{interval_stream, sleep_until, timeout, Instant},
     id::{ConnId, LinkId, OwnedConnId},
@@ -107,6 +108,28 @@ struct SentReliable {
     status: AtomicRefCell<SentReliableStatus>,
 }
 
+/// Kind of copy sent for a reliable packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SentCopyKind {
+    /// First scheduled copy.
+    Primary,
+    /// Delayed low-latency copy.
+    Hedge,
+    /// Timeout-driven retransmission.
+    Resend,
+}
+
+/// One in-flight copy of a reliable packet.
+#[derive(Debug, Clone)]
+struct SentReliableCopy {
+    /// Time packet copy was sent.
+    sent: Instant,
+    /// Index of link used to send the copy.
+    link_id: usize,
+    /// Copy kind.
+    kind: SentCopyKind,
+}
+
 impl fmt::Debug for SentReliable {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("SentReliable")
@@ -119,16 +142,12 @@ impl fmt::Debug for SentReliable {
 /// Status of a sent reliable packet.
 #[derive(Debug, Clone)]
 enum SentReliableStatus {
-    /// Message was sent, but its reception is not yet confirmed.
-    Sent {
-        /// Time packet was sent.
-        sent: Instant,
-        /// Index of link used to send the packet.
-        link_id: usize,
+    /// Message has one or more copies in flight, but its reception is not yet confirmed.
+    InFlight {
         /// Sent message.
         msg: ReliableMsg,
-        /// Whether packet has been resent.
-        resent: bool,
+        /// In-flight copies.
+        copies: Vec<SentReliableCopy>,
     },
     /// Message was received by remote endpoint.
     Received {
@@ -141,6 +160,29 @@ enum SentReliableStatus {
         msg: ReliableMsg,
     },
 }
+
+impl SentReliableStatus {
+    fn in_flight_link_ids(&self) -> Option<Vec<usize>> {
+        match self {
+            Self::InFlight { copies, .. } => Some(copies.iter().map(|copy| copy.link_id).collect()),
+            _ => None,
+        }
+    }
+}
+
+fn reliable_data_size(msg: &ReliableMsg) -> usize {
+    match msg {
+        ReliableMsg::Data(data) => data.len(),
+        _ => 0,
+    }
+}
+
+const LOW_LATENCY_SCORE_MIN: i32 = -128;
+const LOW_LATENCY_SCORE_MAX: i32 = 128;
+const LOW_LATENCY_ACK_REWARD: i32 = 8;
+const LOW_LATENCY_RECOVERY_REWARD: i32 = 1;
+const LOW_LATENCY_MISS_PENALTY: i32 = 2;
+const LOW_LATENCY_TIMEOUT_PENALTY: i32 = 32;
 
 /// Received reliable message.
 #[derive(Debug, Clone)]
@@ -171,6 +213,8 @@ enum TaskEvent<TX, RX, TAG> {
     ConfirmTimedOut(usize),
     /// Resend packet over an idle link.
     Resend(Arc<SentReliable>),
+    /// Send a low-latency hedge copy over an idle link.
+    Hedge(Arc<SentReliable>),
     /// Data consumer was dropped.
     ReadDropped,
     /// Data consumer was closed.
@@ -275,6 +319,14 @@ pub struct Task<TX, RX, TAG> {
     txed_unconsumed: usize,
     /// Size of data received by remote endpoint that cannot yet be consumed.
     txed_unconsumable: usize,
+    /// Total primary data bytes sent.
+    primary_sent_bytes: usize,
+    /// Total redundant data bytes sent.
+    redundant_sent_bytes: usize,
+    /// Total hedge data copies sent.
+    hedge_sent: usize,
+    /// Hedge data copies whose acknowledgement arrived first for their sequence.
+    hedge_won: usize,
     /// Sequence number of last packet consumed by the remote endpoint.
     txed_last_consumed: Seq,
     /// Queue of packets that have been declared lost and must be send again.
@@ -289,6 +341,8 @@ pub struct Task<TX, RX, TAG> {
     rxed_reliable_consumable: VecDeque<ReceivedReliableMsg>,
     /// Sum of size of all buffers in `rxed_reliable` and `rxed_reliable_consumable`.
     rxed_reliable_size: usize,
+    /// Duplicate data packets received and dropped.
+    duplicate_data_received: usize,
     /// Size of that that has been consumed since last acknowledgement.
     rxed_reliable_consumed_since_last_ack: usize,
     /// Forces acking consumed data.
@@ -377,8 +431,13 @@ where
             rxed_reliable_consumed_since_last_ack: 0,
             txed_unconsumed: 0,
             txed_unconsumable: 0,
+            primary_sent_bytes: 0,
+            redundant_sent_bytes: 0,
+            hedge_sent: 0,
+            hedge_won: 0,
             txed_last_consumed: Seq::MINUS_ONE,
             rxed_reliable_size: 0,
+            duplicate_data_received: 0,
             rxed_reliable_consumed_force_ack: false,
             unflushed_links: HashSet::new(),
             flushed_tx: None,
@@ -543,6 +602,24 @@ where
                 }
             };
 
+            let sendable_idle_link_id = self.sendable_idle_link_excluding(&[]);
+            let sender_request_pending =
+                self.sender_request_pending(tx_seq_avail, tx_space, sendable_idle_link_id);
+            let earliest_hedge_timeout = self.earliest_hedge_timeout();
+            let hedge_due =
+                earliest_hedge_timeout.as_ref().is_some_and(|(_, timeout)| *timeout <= Instant::now());
+            let hedge_blocks_primary = hedge_due && self.hedge_preempts_primary();
+            let hedge_select_enabled = self.hedge_preempts_primary() || !(sender_request_pending || resending);
+            let hedge_task = async move {
+                match earliest_hedge_timeout {
+                    Some((packet, timeout)) => {
+                        sleep_until(timeout).await;
+                        packet
+                    }
+                    None => future::pending().await,
+                }
+            };
+
             // Task waiting for termination request.
             let terminate_task = async {
                 match self.terminate_rx.recv().await {
@@ -566,14 +643,14 @@ where
             };
 
             // Task for receiving requests from sender.
-            let sendable_idle_link_id =
-                self.idle_links.iter().rev().cloned().find(|id| self.links[*id].as_ref().unwrap().is_sendable());
             let write_rx_task = async {
                 if links_idling && is_consume_ack_required {
                     TaskEvent::SendConsumed
                 } else {
                     match &mut self.write_rx {
-                        Some(write_rx) if tx_seq_avail && !resending => {
+                        Some(write_rx)
+                            if tx_seq_avail && !resending && !hedge_blocks_primary =>
+                        {
                             match write_rx
                                 .recv_if(|msg| match msg {
                                     SendReq::Send(data) => {
@@ -667,6 +744,7 @@ where
                 link_id = next_unconfirmed_timeout => TaskEvent::LinkUnconfirmedTimeout(link_id),
                 link_id = next_send_timeout => TaskEvent::LinkSendTimeout(link_id),
                 packet = resend_task => TaskEvent::Resend (packet),
+                packet = hedge_task, if hedge_select_enabled => TaskEvent::Hedge(packet),
                 consume_event = consume_task => consume_event,
                 event = read_closed_task => event,
                 () = link_testing_timeout => TaskEvent::LinkTesting,
@@ -731,6 +809,13 @@ where
                     match event {
                         LinkIntEvent::TxReady => {
                             // Link is ready to send more data.
+                            let hedge_candidate = self.links[id]
+                                .as_ref()
+                                .filter(|link| {
+                                    link.unconfirmed.is_none() && !link.is_blocked() && link.is_sendable()
+                                })
+                                .and_then(|_| self.hedge_candidate_for_link(id));
+                            let hedge_preempts_primary = self.hedge_preempts_primary();
                             let link = self.links[id].as_mut().unwrap();
                             let link_blocked = link.blocked.load(Ordering::SeqCst);
                             if link.needs_tx_accepted {
@@ -792,6 +877,12 @@ where
                                     );
                                     self.idle_links.retain(|idle_id| *idle_id != id);
                                     self.resend_reliable_over_link(id, packet);
+                                } else if let (true, Some(packet)) =
+                                    (hedge_preempts_primary, hedge_candidate.as_ref())
+                                {
+                                    tracing::trace!(?link_id, "hedging packet {} over non-idle link", packet.seq);
+                                    self.idle_links.retain(|idle_id| *idle_id != id);
+                                    self.send_redundant_reliable_over_link(id, packet, SentCopyKind::Hedge);
                                 } else if self.read_closed_rx.is_none() && !self.receive_close_sent {
                                     tracing::trace!(?link_id, "sending ReceiveClose over non-idle link");
                                     self.idle_links.retain(|&idle_id| idle_id != id);
@@ -825,6 +916,12 @@ where
                                     );
                                     self.idle_links.retain(|idle_id| *idle_id != id);
                                     self.send_reliable_over_link(id, ReliableMsg::Data(data));
+                                } else if let (false, Some(packet)) =
+                                    (hedge_preempts_primary, hedge_candidate.as_ref())
+                                {
+                                    tracing::trace!(?link_id, "hedging packet {} over non-idle link", packet.seq);
+                                    self.idle_links.retain(|idle_id| *idle_id != id);
+                                    self.send_redundant_reliable_over_link(id, packet, SentCopyKind::Hedge);
                                 } else if link.need_ack_flush() {
                                     tracing::trace!(
                                         ?link_id,
@@ -971,6 +1068,15 @@ where
                     self.idle_links.retain(|&idle_id| idle_id != id);
                     tracing::trace!(?link_id, "resending message {} over idle link", packet.seq);
                     self.resend_reliable_over_link(id, packet);
+                }
+                TaskEvent::Hedge(packet) => {
+                    let excluded = packet.status.borrow().in_flight_link_ids().unwrap_or_default();
+                    if let Some(id) = self.sendable_idle_link_for_redundant_copy(&excluded) {
+                        let link_id = self.links[id].as_ref().unwrap().link_id();
+                        self.idle_links.retain(|&idle_id| idle_id != id);
+                        tracing::trace!(?link_id, "hedging message {} over idle link", packet.seq);
+                        self.send_redundant_reliable_over_link(id, &packet, SentCopyKind::Hedge);
+                    }
                 }
                 TaskEvent::ReadDropped => {
                     tracing::debug!("receiver was dropped");
@@ -1217,6 +1323,26 @@ where
         self.txed_packets.front().map(|p| self.tx_seq - p.seq <= Seq::USABLE_INTERVAL).unwrap_or(true)
     }
 
+    /// Returns whether a sender request can be handled immediately.
+    fn sender_request_pending(
+        &mut self, tx_seq_avail: bool, tx_space: usize, sendable_idle_link_id: Option<usize>,
+    ) -> bool {
+        self.write_rx.as_mut().and_then(|rx| rx.try_peek().ok()).is_some_and(|msg| match msg {
+            SendReq::Send(data) => tx_seq_avail && sendable_idle_link_id.is_some() && data.len() <= tx_space,
+            SendReq::Flush(_) => true,
+        })
+    }
+
+    /// Returns whether delayed hedge copies are enabled by the aggregate mode.
+    fn hedge_enabled(&self) -> bool {
+        matches!(self.cfg.agg_mode, AggMode::BandwidthRedundant | AggMode::LowLatency)
+    }
+
+    /// Returns whether hedge copies should preempt newly available primary data.
+    fn hedge_preempts_primary(&self) -> bool {
+        matches!(self.cfg.agg_mode, AggMode::LowLatency)
+    }
+
     /// Adjusts the link transmission buffer limits to ensure that no link stalls the channel.
     fn adjust_link_tx_limits(&mut self) {
         let Some(remote_recv_buffer) = self.remote_recv_buffer() else { return };
@@ -1236,12 +1362,9 @@ where
         if (soft_overrun && self.tx_overrun == SendOverrun::Armed)
             || (hard_overrun && self.tx_overrun != SendOverrun::Hard)
         {
-            if let Some(id) = self.txed_packets.iter().find_map(|p| {
-                if let SentReliableStatus::Sent { link_id, .. } = &*p.status.borrow() {
-                    Some(*link_id)
-                } else {
-                    None
-                }
+            if let Some(id) = self.txed_packets.iter().find_map(|p| match &*p.status.borrow() {
+                SentReliableStatus::InFlight { copies, .. } => copies.first().map(|copy| copy.link_id),
+                _ => None,
             }) {
                 let link = self.links[id].as_mut().unwrap();
 
@@ -1418,17 +1541,139 @@ where
         }
     }
 
+    /// Returns a ready link that can send a copy and is not in `excluded`.
+    fn sendable_idle_link_excluding(&self, excluded: &[usize]) -> Option<usize> {
+        self.idle_links.iter().rev().cloned().find(|id| self.is_sendable_idle_link_excluding(*id, excluded))
+    }
+
+    /// Returns a ready link for a low-latency hedge copy, preferring reliable and fast links.
+    fn sendable_idle_link_for_redundant_copy(&self, excluded: &[usize]) -> Option<usize> {
+        self.idle_links
+            .iter()
+            .copied()
+            .filter(|id| self.is_sendable_idle_link_excluding(*id, excluded))
+            .max_by_key(|id| self.low_latency_link_preference(*id))
+    }
+
+    /// Returns whether `id` is an idle link that can send and is not excluded.
+    fn is_sendable_idle_link_excluding(&self, id: usize, excluded: &[usize]) -> bool {
+        !excluded.contains(&id)
+            && self.links[id]
+                .as_ref()
+                .map(|link| link.unconfirmed.is_none() && !link.is_blocked() && link.is_sendable())
+                .unwrap_or_default()
+    }
+
+    /// Preference key for low-latency copy target selection.
+    fn low_latency_link_preference(&self, id: usize) -> (i32, Reverse<Duration>, Reverse<usize>) {
+        let link = self.links[id].as_ref().unwrap();
+        (link.low_latency_score, Reverse(link.roundtrip), Reverse(link.txed_unacked_data))
+    }
+
+    /// Returns whether another redundant copy can be sent within the low-latency budget.
+    fn redundancy_budget_allows(&self, msg: &ReliableMsg) -> bool {
+        let size = reliable_data_size(msg);
+        if size == 0 {
+            return true;
+        }
+
+        match self.cfg.agg_mode {
+            AggMode::Bandwidth => false,
+            AggMode::BandwidthRedundant | AggMode::LowLatency => {
+                // Allow one packet of temporary budget debt so short interactive flows can hedge
+                // their first delayed packet instead of waiting to accrue enough primary bytes.
+                let redundant = (self.redundant_sent_bytes + size) as u128 * 100;
+                let allowed = self.primary_sent_bytes as u128 * self.cfg.max_redundancy_overhead_percent as u128
+                    + size as u128 * 100;
+                redundant <= allowed
+            }
+        }
+    }
+
+    /// Delay before hedging a copy sent on `link_id`.
+    fn hedge_delay(&self, link_id: usize) -> Duration {
+        let roundtrip = self.links[link_id].as_ref().map(|link| link.roundtrip).unwrap_or_default();
+        ((roundtrip * self.cfg.hedge_delay_roundtrip_percent.get()) / 100)
+            .clamp(self.cfg.hedge_delay_min, self.cfg.hedge_delay_max)
+    }
+
+    /// Time when the next packet should be hedged.
+    fn earliest_hedge_timeout(&self) -> Option<(Arc<SentReliable>, Instant)> {
+        if !self.hedge_enabled() {
+            return None;
+        }
+
+        for packet in &self.txed_packets {
+            let status = packet.status.borrow();
+            let SentReliableStatus::InFlight { msg, copies } = &*status else { continue };
+            if !matches!(msg, ReliableMsg::Data(_)) || copies.iter().any(|copy| copy.kind == SentCopyKind::Hedge)
+            {
+                continue;
+            }
+            if !self.redundancy_budget_allows(msg) {
+                continue;
+            }
+
+            let excluded: Vec<_> = copies.iter().map(|copy| copy.link_id).collect();
+            if self.sendable_idle_link_for_redundant_copy(&excluded).is_none() {
+                continue;
+            }
+
+            if let Some(primary) = copies.first() {
+                return Some((packet.clone(), primary.sent + self.hedge_delay(primary.link_id)));
+            }
+        }
+
+        None
+    }
+
+    /// Finds a delayed packet that should be hedged over `link_id` now.
+    fn hedge_candidate_for_link(&self, link_id: usize) -> Option<Arc<SentReliable>> {
+        if !self.hedge_enabled() {
+            return None;
+        }
+
+        let now = Instant::now();
+        for packet in &self.txed_packets {
+            let status = packet.status.borrow();
+            let SentReliableStatus::InFlight { msg, copies } = &*status else { continue };
+            if !matches!(msg, ReliableMsg::Data(_))
+                || copies.iter().any(|copy| copy.kind == SentCopyKind::Hedge || copy.link_id == link_id)
+                || !self.redundancy_budget_allows(msg)
+            {
+                continue;
+            }
+
+            if let Some(primary) = copies.first() {
+                if primary.sent + self.hedge_delay(primary.link_id) <= now {
+                    return Some(packet.clone());
+                }
+            }
+        }
+
+        None
+    }
+
     /// Time when the earliest sent packet times out confirmation.
     ///
     /// Returns link id and instant of timeout.
     fn earliest_confirm_timeout(&self) -> Option<(usize, Instant)> {
         for p in &self.txed_packets {
-            if let SentReliableStatus::Sent { link_id, sent, resent, .. } = &*p.status.borrow() {
-                let link = self.links[*link_id].as_ref().unwrap();
-                let dur_factor = if *resent { 3 } else { 1 };
-                let dur = (link.roundtrip * self.cfg.link_ack_timeout_roundtrip_factor.get() * dur_factor)
-                    .clamp(self.cfg.link_ack_timeout_min, self.cfg.link_ack_timeout_max);
-                return Some((*link_id, *sent + dur));
+            let status = p.status.borrow();
+            let SentReliableStatus::InFlight { copies, .. } = &*status else { continue };
+            let earliest = copies
+                .iter()
+                .filter_map(|copy| {
+                    let link = self.links.get(copy.link_id)?.as_ref()?;
+                    let dur_factor = if copy.kind == SentCopyKind::Resend { 3 } else { 1 };
+                    let dur = (link.roundtrip * self.cfg.link_ack_timeout_roundtrip_factor.get() * dur_factor)
+                        .clamp(self.cfg.link_ack_timeout_min, self.cfg.link_ack_timeout_max);
+                    Some((copy.link_id, copy.sent + dur))
+                })
+                .min_by_key(|(_link_id, timeout)| *timeout);
+
+            if earliest.is_some() {
+                return earliest;
             }
         }
 
@@ -1466,56 +1711,89 @@ where
     /// Sends a sequenced reliable message over the specified link.
     fn send_reliable_over_link(&mut self, id: usize, reliable_msg: ReliableMsg) -> Seq {
         let seq = self.next_tx_seq();
-        let link = self.links[id].as_mut().unwrap();
-
-        // Send message.
-        tracing::trace!(link_id =? link.link_id(), "sending reliable message {seq} over link: {reliable_msg:?}");
-        let (msg, data) = reliable_msg.to_link_msg(seq);
-        link.start_send_msg(msg, data);
+        let copy = self.send_reliable_copy_over_link(id, seq, &reliable_msg, SentCopyKind::Primary);
 
         // Update statistics.
         if let ReliableMsg::Data(data) = &reliable_msg {
             self.txed_unacked += data.len();
             self.txed_unconsumed += data.len();
-            link.txed_unacked_data += data.len();
+            self.primary_sent_bytes += data.len();
         }
 
         // Store sent message until confirmation to be able to resend it should the link fail.
         let packet = SentReliable {
             seq,
-            status: AtomicRefCell::new(SentReliableStatus::Sent {
-                sent: Instant::now(),
-                link_id: id,
-                msg: reliable_msg,
-                resent: false,
-            }),
+            status: AtomicRefCell::new(SentReliableStatus::InFlight { msg: reliable_msg, copies: vec![copy] }),
         };
-        self.txed_packets.push_back(Arc::new(packet));
+        let packet = Arc::new(packet);
+        self.txed_packets.push_back(packet);
 
         seq
     }
 
-    /// Resends a packet over the specified link.
-    fn resend_reliable_over_link(&mut self, id: usize, packet: Arc<SentReliable>) {
+    /// Sends one copy of a reliable message over the specified link.
+    fn send_reliable_copy_over_link(
+        &mut self, id: usize, seq: Seq, reliable_msg: &ReliableMsg, kind: SentCopyKind,
+    ) -> SentReliableCopy {
         let link = self.links[id].as_mut().unwrap();
+        let link_id = link.link_id();
 
-        // Extract message and link used for sending.
-        let mut status = packet.status.borrow_mut();
-        let SentReliableStatus::ResendQueued { msg: reliable_msg } = &*status else {
-            unreachable!("message was not queued for resending")
-        };
-
-        // Send data.
-        tracing::trace!(link_id =? link.link_id(), "resending reliable message {} over link: {:?}", packet.seq, reliable_msg);
-        let (msg, data) = reliable_msg.to_link_msg(packet.seq);
+        tracing::trace!(?link_id, ?kind, "sending reliable message {seq} over link: {reliable_msg:?}");
+        let (msg, data) = reliable_msg.to_link_msg(seq);
         link.start_send_msg(msg, data);
 
-        // Update link statistics.
         if let ReliableMsg::Data(data) = reliable_msg {
             link.txed_unacked_data += data.len();
+            if kind != SentCopyKind::Primary {
+                self.redundant_sent_bytes += data.len();
+            }
+            if kind == SentCopyKind::Hedge {
+                self.hedge_sent += 1;
+            }
         }
 
+        SentReliableCopy { sent: Instant::now(), link_id: id, kind }
+    }
+
+    /// Sends an additional copy of an in-flight packet over the specified link.
+    fn send_redundant_reliable_over_link(&mut self, id: usize, packet: &Arc<SentReliable>, kind: SentCopyKind) {
+        let Some(reliable_msg) = ({
+            let status = packet.status.borrow();
+            match &*status {
+                SentReliableStatus::InFlight { msg, copies }
+                    if !copies.iter().any(|copy| copy.link_id == id)
+                        && (kind != SentCopyKind::Hedge || self.redundancy_budget_allows(msg)) =>
+                {
+                    Some(msg.clone())
+                }
+                _ => None,
+            }
+        }) else {
+            return;
+        };
+
+        let copy = self.send_reliable_copy_over_link(id, packet.seq, &reliable_msg, kind);
+
+        let mut status = packet.status.borrow_mut();
+        if let SentReliableStatus::InFlight { copies, .. } = &mut *status {
+            copies.push(copy);
+        }
+    }
+
+    /// Resends a packet over the specified link.
+    fn resend_reliable_over_link(&mut self, id: usize, packet: Arc<SentReliable>) {
+        let reliable_msg = {
+            let status = packet.status.borrow();
+            let SentReliableStatus::ResendQueued { msg } = &*status else {
+                return;
+            };
+            msg.clone()
+        };
+
+        let copy = self.send_reliable_copy_over_link(id, packet.seq, &reliable_msg, SentCopyKind::Resend);
+
         // Adjust last buffer increase sequence number if necessary.
+        let link = self.links[id].as_mut().unwrap();
         match &mut link.txed_unacked_data_limit_increased {
             Some(last_increased) if packet.seq < *last_increased => {
                 *last_increased = packet.seq;
@@ -1524,16 +1802,13 @@ where
         }
 
         // Update packet.
-        *status = SentReliableStatus::Sent {
-            sent: Instant::now(),
-            link_id: id,
-            msg: reliable_msg.clone(),
-            resent: true,
-        };
+        *packet.status.borrow_mut() = SentReliableStatus::InFlight { msg: reliable_msg, copies: vec![copy] };
     }
 
     /// Unconfirms a link.
     fn unconfirm_link(&mut self, id: usize, reason: NotWorkingReason) {
+        let ack_timeout = matches!(reason, NotWorkingReason::AckTimeout);
+
         // Mark link as unconfirmed.
         let link = self.links[id].as_mut().unwrap();
         link.unconfirmed = Some((Instant::now(), reason));
@@ -1543,25 +1818,32 @@ where
         // Flush link.
         link.start_flush();
 
+        if ack_timeout {
+            link.low_latency_score =
+                link.low_latency_score.saturating_sub(LOW_LATENCY_TIMEOUT_PENALTY).max(LOW_LATENCY_SCORE_MIN);
+        }
         // Reset limits.
         link.reset();
 
-        // Mark packets as being resent and put them into resend queue.
+        // Mark packets without remaining copies for resending.
         for p in &mut self.txed_packets {
             let mut status = p.status.borrow_mut();
-            match &*status {
-                SentReliableStatus::Sent { link_id, msg, .. } if *link_id == id => {
-                    // Update link statistics.
-                    if let ReliableMsg::Data(data) = &msg {
-                        let old_link = self.links[*link_id].as_mut().unwrap();
-                        old_link.txed_unacked_data -= data.len();
-                    }
+            if let SentReliableStatus::InFlight { msg, copies } = &mut *status {
+                let data_size = reliable_data_size(msg);
+                let before = copies.len();
+                copies.retain(|copy| copy.link_id != id);
 
+                if before != copies.len() && data_size != 0 {
+                    if let Some(link) = self.links[id].as_mut() {
+                        link.txed_unacked_data = link.txed_unacked_data.saturating_sub(data_size);
+                    }
+                }
+
+                if copies.is_empty() {
                     *status = SentReliableStatus::ResendQueued { msg: msg.clone() };
                     self.resend_queue.push_back(p.clone());
                 }
-                _ => (),
-            };
+            }
         }
 
         // Sort resend queue, so that oldest packets are resend first.
@@ -1782,6 +2064,9 @@ where
             // The sequence number belongs to a packet that has already been
             // received and consumed. Thus the acknowledgement has been
             // lost and must be resend.
+            if matches!(msg, ReliableMsg::Data(_)) {
+                self.duplicate_data_received += 1;
+            }
             tracing::trace!(?link_id, "rereceived consumed reliable message {}", seq);
         } else {
             let offset = (seq - self.rx_seq) as usize;
@@ -1826,6 +2111,9 @@ where
             } else {
                 // The sequence number belongs to a packet that has alredy been
                 // received. Thus the acknowledgement has been lost and must be resend.
+                if matches!(msg, ReliableMsg::Data(_)) {
+                    self.duplicate_data_received += 1;
+                }
                 tracing::trace!(?link_id, "rereceived unconsumed reliable message {}", seq);
             }
         }
@@ -1854,18 +2142,19 @@ where
 
     /// Handles a received acknowledgement.
     fn handle_ack(&mut self, id: usize, rxed_seq: Seq) {
-        let link = self.links[id].as_mut().unwrap();
-        let link_id = link.link_id();
+        let link_id = self.links[id].as_ref().unwrap().link_id();
 
         tracing::trace!(?link_id, "processing received ack for {rxed_seq} on link");
 
         // Possibly unblock send buffer increase.
-        match link.txed_unacked_data_limit_increased {
-            Some(last_increased) if last_increased <= rxed_seq => {
-                tracing::trace!(?link_id, "re-allowing increase of send limit of link");
-                link.txed_unacked_data_limit_increased = None;
+        if let Some(link) = self.links[id].as_mut() {
+            match link.txed_unacked_data_limit_increased {
+                Some(last_increased) if last_increased <= rxed_seq => {
+                    tracing::trace!(?link_id, "re-allowing increase of send limit of link");
+                    link.txed_unacked_data_limit_increased = None;
+                }
+                _ => (),
             }
-            _ => (),
         }
 
         // Remove packet that has been received by remote endpoint.
@@ -1876,28 +2165,59 @@ where
             assert_eq!(packet.seq, rxed_seq);
 
             let mut status = packet.status.borrow_mut();
-            match &*status {
-                SentReliableStatus::Sent { sent, link_id, msg, .. } if *link_id == id => {
-                    let size = if let ReliableMsg::Data(data) = &msg { data.len() } else { 0 };
-
-                    link.txed_unacked_data -= size;
-                    self.txed_unacked -= size;
-                    self.txed_unconsumable += size;
-
-                    link.roundtrip = (99 * link.roundtrip + sent.elapsed()) / 100;
-
-                    *status = SentReliableStatus::Received { size };
+            let received = match &*status {
+                SentReliableStatus::InFlight { msg, copies } => {
+                    let ack_elapsed =
+                        copies.iter().find(|copy| copy.link_id == id).map(|copy| copy.sent.elapsed());
+                    let acked_copy_kind = copies.iter().find(|copy| copy.link_id == id).map(|copy| copy.kind);
+                    Some((reliable_data_size(msg), copies.clone(), ack_elapsed, acked_copy_kind))
                 }
                 SentReliableStatus::ResendQueued { msg } => {
-                    let size = if let ReliableMsg::Data(data) = &msg { data.len() } else { 0 };
-
-                    self.txed_unacked -= size;
-                    self.txed_unconsumable += size;
-                    self.resend_queue.retain(|packet| packet.seq != rxed_seq);
-
-                    *status = SentReliableStatus::Received { size };
+                    Some((reliable_data_size(msg), Vec::new(), None, None))
                 }
-                _ => (),
+                SentReliableStatus::Received { .. } => None,
+            };
+
+            if let Some((size, copies, ack_elapsed, acked_copy_kind)) = received {
+                if size != 0 {
+                    let multi_copy = copies.len() > 1;
+                    for copy in &copies {
+                        if let Some(link) = self.links.get_mut(copy.link_id).and_then(Option::as_mut) {
+                            link.txed_unacked_data = link.txed_unacked_data.saturating_sub(size);
+                            if copy.link_id == id {
+                                if multi_copy || link.low_latency_score < 0 {
+                                    let reward = if multi_copy {
+                                        LOW_LATENCY_ACK_REWARD
+                                    } else {
+                                        LOW_LATENCY_RECOVERY_REWARD
+                                    };
+                                    link.low_latency_score =
+                                        link.low_latency_score.saturating_add(reward).min(LOW_LATENCY_SCORE_MAX);
+                                }
+                            } else if multi_copy {
+                                link.low_latency_score = link
+                                    .low_latency_score
+                                    .saturating_sub(LOW_LATENCY_MISS_PENALTY)
+                                    .max(LOW_LATENCY_SCORE_MIN);
+                            }
+                        }
+                    }
+
+                    self.txed_unacked = self.txed_unacked.saturating_sub(size);
+                    self.txed_unconsumable += size;
+                    if acked_copy_kind == Some(SentCopyKind::Hedge) {
+                        self.hedge_won += 1;
+                    }
+                }
+
+                if let Some(elapsed) = ack_elapsed {
+                    if let Some(link) = self.links[id].as_mut() {
+                        link.roundtrip = (99 * link.roundtrip + elapsed) / 100;
+                    }
+                }
+
+                self.resend_queue.retain(|packet| packet.seq != rxed_seq);
+                *status = SentReliableStatus::Received { size };
             }
         }
 
@@ -1932,6 +2252,16 @@ where
                 sent_unconsumed_count: self.txed_packets.len(),
                 sent_unconsumable: self.txed_unconsumable,
                 resend_queue_len: self.resend_queue.len(),
+                primary_sent: self.primary_sent_bytes,
+                redundant_sent: self.redundant_sent_bytes,
+                redundancy_overhead_percent: if self.primary_sent_bytes == 0 {
+                    0
+                } else {
+                    self.redundant_sent_bytes * 100 / self.primary_sent_bytes
+                },
+                hedge_sent: self.hedge_sent,
+                hedge_won: self.hedge_won,
+                duplicate_data_received: self.duplicate_data_received,
                 recved_unconsumed: self.rxed_reliable_size,
                 recved_unconsumed_count: self.rxed_reliable.len(),
             });

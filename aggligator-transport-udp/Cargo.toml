@@ -1,0 +1,28 @@
+[package]
+name = "aggligator-transport-udp"
+version = "0.1.0"
+description = "Aggligator transport: unreliable UDP datagrams"
+categories = ["asynchronous", "network-programming"]
+keywords = ["aggligator", "aggligator-transport", "udp", "multipath"]
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+aggligator = { version = "0.9.11", path = "../aggligator" }
+
+async-trait = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true, features = ["net", "sync", "time"] }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+
+network-interface = "2"
+rand = { workspace = true }
+socket2 = { version = "0.6.0", features = ["all"] }
+
+[package.metadata.docs.rs]
+rustdoc-args = ["--cfg", "docsrs"]

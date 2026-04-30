@@ -280,6 +280,7 @@ async fn very_high_latency() {
         latency: Some(Duration::from_millis(1000)),
         buffer_size: 10_000_000,
         buffer_items: 5000,
+        ..Default::default()
     };
     let alc_cfg = Cfg {
         send_buffer: NonZeroU32::new(20_000_000).unwrap(),
@@ -320,6 +321,7 @@ async fn ten_mb_per_s() {
         latency: Some(Duration::from_millis(10)),
         buffer_size: 10_000_000,
         buffer_items: 5000,
+        ..Default::default()
     };
     let alc_cfg = Cfg {
         send_queue: NonZeroUsize::new(50).unwrap(),

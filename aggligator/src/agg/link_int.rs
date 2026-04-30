@@ -159,6 +159,8 @@ pub(crate) struct LinkInt<TX, RX, TAG> {
     pub(crate) test: LinkTest,
     /// Last measured roundtrip duration.
     pub(crate) roundtrip: Duration,
+    /// Recent relative reliability score used for low-latency hedge target selection.
+    pub(crate) low_latency_score: i32,
     /// When last ping has been performed.
     pub(crate) last_ping: Option<Instant>,
     /// When current (not yet answered) ping has been sent.
@@ -261,6 +263,7 @@ where
             send_ping: false,
             send_pong: false,
             roundtrip,
+            low_latency_score: 0,
             disconnecting: None,
             txed_unacked_data: 0,
             txed_unacked_data_limit: cfg.link_unacked_init.get(),
@@ -623,6 +626,7 @@ where
         self.txed_unacked_data_limit = self.txed_unacked_data_limit.clamp(128, self.cfg.link_unacked_init.get());
         self.txed_unacked_data_limit_increased = None;
         self.txed_unacked_data_limit_increased_consecutively = 0;
+        self.low_latency_score = self.low_latency_score.min(0);
     }
 
     /// Whether link is blocked locally or remotely.

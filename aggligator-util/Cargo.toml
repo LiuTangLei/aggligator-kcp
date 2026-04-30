@@ -15,8 +15,6 @@ repository.workspace = true
 [features]
 default = ["usb-host"]
 bluer = ["dep:aggligator-transport-bluer"]
-fec = ["aggligator-transport-kcp/fec"]
-phantun = ["aggligator-transport-kcp/phantun"]
 usb-device = ["aggligator-transport-usb/device"]
 usb-host = ["aggligator-transport-usb/host"]
 raw-speed-cli = []
@@ -26,7 +24,7 @@ aggligator = { version = "0.9.11", path = "../aggligator", features = ["dump"] }
 aggligator-monitor = { version = "0.9.7", path = "../aggligator-monitor" }
 aggligator-transport-bluer = { version = "0.1.1", path = "../aggligator-transport-bluer", optional = true }
 aggligator-transport-tcp = { version = "0.2.4", path = "../aggligator-transport-tcp" }
-aggligator-transport-kcp = { version = "0.1.0", path = "../aggligator-transport-kcp" }
+aggligator-transport-udp = { version = "0.1.0", path = "../aggligator-transport-udp" }
 aggligator-transport-usb = { version = "0.6.0", path = "../aggligator-transport-usb", optional = true }
 aggligator-transport-websocket = { version = "0.6.0", path = "../aggligator-transport-websocket" }
 aggligator-wrapper-tls = { version = "0.2.0", path = "../aggligator-wrapper-tls" }

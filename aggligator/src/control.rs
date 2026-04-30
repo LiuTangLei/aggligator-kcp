@@ -459,6 +459,18 @@ pub struct Stats {
     pub sent_unconsumable: usize,
     /// Length of the queue for resending lost packets.
     pub resend_queue_len: usize,
+    /// Total primary data bytes sent.
+    pub primary_sent: usize,
+    /// Total redundant data bytes sent for hedge and retransmission copies.
+    pub redundant_sent: usize,
+    /// Redundant data overhead in percent of primary data.
+    pub redundancy_overhead_percent: usize,
+    /// Total hedge data copies sent.
+    pub hedge_sent: usize,
+    /// Hedge data copies whose acknowledgement arrived before other in-flight copies.
+    pub hedge_won: usize,
+    /// Duplicate data packets received and dropped.
+    pub duplicate_data_received: usize,
     /// Size of data that has been received and not yet consumed.
     pub recved_unconsumed: usize,
     /// Number of packets received and not yet consumed.

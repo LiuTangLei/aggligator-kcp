@@ -35,12 +35,69 @@ pub struct Cfg {
     pub buffer_size: usize,
     /// Latency.
     pub latency: Option<Duration>,
+    /// Drop every Nth packet after `drop_start` packets have passed.
+    pub drop_every: Option<usize>,
+    /// Number of packets to pass before applying `drop_every`.
+    pub drop_start: usize,
+    /// Drop every Nth AGD1 data datagram after `drop_data_start` data datagrams have passed.
+    pub drop_data_every: Option<usize>,
+    /// Number of AGD1 data datagrams to pass before applying `drop_data_every`.
+    pub drop_data_start: usize,
+    /// Add extra latency to every Nth packet after `jitter_start` packets have passed.
+    pub jitter_every: Option<usize>,
+    /// Number of packets to pass before applying `jitter_every`.
+    pub jitter_start: usize,
+    /// Extra latency applied by `jitter_every`.
+    pub jitter: Duration,
 }
 
 impl Default for Cfg {
     fn default() -> Self {
-        Self { speed: 0, buffer_items: 128, buffer_size: 16384, latency: None }
+        Self {
+            speed: 0,
+            buffer_items: 128,
+            buffer_size: 16384,
+            latency: None,
+            drop_every: None,
+            drop_start: 0,
+            drop_data_every: None,
+            drop_data_start: 0,
+            jitter_every: None,
+            jitter_start: 0,
+            jitter: Duration::ZERO,
+        }
     }
+}
+
+impl Cfg {
+    fn should_drop(&self, packet_index: usize) -> bool {
+        matches!(self.drop_every, Some(every) if every > 0
+            && packet_index > self.drop_start
+            && (packet_index - self.drop_start).is_multiple_of(every))
+    }
+
+    fn should_drop_data(&self, data_packet_index: usize) -> bool {
+        matches!(self.drop_data_every, Some(every) if every > 0
+            && data_packet_index > self.drop_data_start
+            && (data_packet_index - self.drop_data_start).is_multiple_of(every))
+    }
+
+    fn extra_latency(&self, packet_index: usize) -> Duration {
+        match self.jitter_every {
+            Some(every)
+                if every > 0
+                    && packet_index > self.jitter_start
+                    && (packet_index - self.jitter_start).is_multiple_of(every) =>
+            {
+                self.jitter
+            }
+            _ => Duration::ZERO,
+        }
+    }
+}
+
+fn is_aggligator_data_datagram(data: &Bytes) -> bool {
+    data.len() >= 5 && &data[..4] == b"AGD1" && data[4] == 1
 }
 
 struct Packet {
@@ -53,6 +110,9 @@ enum ControlReq {
     PauseThenDisconnect(Duration),
     SetLatency(Option<Duration>),
     SetSpeed(usize),
+    SetDropEvery { every: Option<usize>, start: usize },
+    SetDropDataEvery { every: Option<usize>, start: usize },
+    SetJitterEvery { every: Option<usize>, start: usize, jitter: Duration },
     Disconnect,
 }
 
@@ -70,6 +130,8 @@ pub fn channel(mut cfg: Cfg) -> (Sender, Receiver, Control) {
 
     let buffer_size = Arc::new(AtomicUsize::new(0));
     let buffer_consumed = Arc::new(Semaphore::new(0));
+    let task_buffer_size = buffer_size.clone();
+    let task_buffer_consumed = buffer_consumed.clone();
 
     let disconnected = Arc::new(AtomicBool::new(false));
 
@@ -95,10 +157,28 @@ pub fn channel(mut cfg: Cfg) -> (Sender, Receiver, Control) {
     exec::spawn(async move {
         let mut control_rx_opt = Some(control_rx);
         let mut sleep_need = Duration::ZERO;
+        let mut packet_index = 0;
+        let mut data_packet_index = 0;
         loop {
             tokio::select! {
                 packet_opt = sender_rx.recv() => {
                     let Some(packet) = packet_opt else { break };
+                    packet_index += 1;
+
+                    let is_data_datagram = is_aggligator_data_datagram(&packet.data);
+                    if is_data_datagram {
+                        data_packet_index += 1;
+                    }
+
+                    if cfg.should_drop(packet_index)
+                        || (is_data_datagram && cfg.should_drop_data(data_packet_index))
+                    {
+                        task_buffer_size.fetch_sub(packet.data.len(), Ordering::SeqCst);
+                        if task_buffer_consumed.available_permits() == 0 {
+                            task_buffer_consumed.add_permits(1);
+                        }
+                        continue;
+                    }
 
                     if let Some(latency) = cfg.latency {
                         let until = packet.sent + latency;
@@ -106,6 +186,11 @@ pub fn channel(mut cfg: Cfg) -> (Sender, Receiver, Control) {
                             // println!("latency wait");
                             sleep_until(until).await;
                         }
+                    }
+
+                    let extra_latency = cfg.extra_latency(packet_index);
+                    if !extra_latency.is_zero() {
+                        sleep(extra_latency).await;
                     }
 
                     if cfg.speed > 0 {
@@ -137,6 +222,22 @@ pub fn channel(mut cfg: Cfg) -> (Sender, Receiver, Control) {
                                 }
                                 ControlReq::SetLatency (latency) => cfg.latency = latency,
                                 ControlReq::SetSpeed (speed) => cfg.speed = speed,
+                                ControlReq::SetDropEvery { every, start } => {
+                                    cfg.drop_every = every;
+                                    cfg.drop_start = start;
+                                    packet_index = 0;
+                                }
+                                ControlReq::SetDropDataEvery { every, start } => {
+                                    cfg.drop_data_every = every;
+                                    cfg.drop_data_start = start;
+                                    data_packet_index = 0;
+                                }
+                                ControlReq::SetJitterEvery { every, start, jitter } => {
+                                    cfg.jitter_every = every;
+                                    cfg.jitter_start = start;
+                                    cfg.jitter = jitter;
+                                    packet_index = 0;
+                                }
                                 ControlReq::Disconnect => {
                                     disconnected.store(true, Ordering::SeqCst);
                                     break;
@@ -186,6 +287,23 @@ impl Control {
     /// Sets the speed.
     pub async fn set_speed(&self, speed: usize) -> Result<(), Error> {
         self.send_req(ControlReq::SetSpeed(speed)).await
+    }
+
+    /// Drops every Nth packet after `start` packets have passed.
+    pub async fn set_drop_every(&self, every: Option<usize>, start: usize) -> Result<(), Error> {
+        self.send_req(ControlReq::SetDropEvery { every, start }).await
+    }
+
+    /// Drops every Nth AGD1 data datagram after `start` data datagrams have passed.
+    pub async fn set_drop_data_every(&self, every: Option<usize>, start: usize) -> Result<(), Error> {
+        self.send_req(ControlReq::SetDropDataEvery { every, start }).await
+    }
+
+    /// Adds extra latency to every Nth packet after `start` packets have passed.
+    pub async fn set_jitter_every(
+        &self, every: Option<usize>, start: usize, jitter: Duration,
+    ) -> Result<(), Error> {
+        self.send_req(ControlReq::SetJitterEvery { every, start, jitter }).await
     }
 
     /// Disconnects the channel.

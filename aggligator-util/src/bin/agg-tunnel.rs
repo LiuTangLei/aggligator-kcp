@@ -9,6 +9,7 @@ use std::{
     collections::{HashMap, HashSet},
     io::stdout,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    num::NonZeroUsize,
     path::PathBuf,
     process::exit,
     sync::Arc,
@@ -16,7 +17,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::{TcpListener, TcpSocket, TcpStream},
+    net::{TcpListener, TcpSocket, TcpStream, UdpSocket},
     select,
     sync::{broadcast, mpsc, oneshot, watch},
     task::block_in_place,
@@ -25,15 +26,17 @@ use tokio::{
 
 use aggligator::{
     alc::{ReceiverStream, SenderSink},
-    cfg::Cfg,
+    cfg::{AggMode, Cfg},
     dump::dump_to_json_line_file,
     exec,
     transport::{AcceptorBuilder, ConnectingTransport, ConnectorBuilder, LinkTagBox},
 };
 use aggligator_monitor::monitor::{interactive_monitor, watch_tags};
-use aggligator_transport_kcp::{KcpAcceptor, KcpConfig, KcpConnector, KcpLinkFilter};
 use aggligator_transport_tcp::{IpVersion, TcpAcceptor, TcpConnector, TcpLinkFilter};
-use aggligator_util::{init_log, load_cfg, parse_kcp_link_filter, parse_tcp_link_filter, print_default_cfg, wait_sigterm};
+use aggligator_transport_udp::{UdpAcceptor, UdpConnector, UdpLinkFilter};
+use aggligator_util::{
+    init_log, load_cfg, parse_tcp_link_filter, parse_udp_link_filter, print_default_cfg, wait_sigterm,
+};
 
 #[cfg(feature = "bluer")]
 use aggligator_transport_bluer::rfcomm::{RfcommAcceptor, RfcommConnector};
@@ -42,7 +45,11 @@ use aggligator_transport_bluer::rfcomm::{RfcommAcceptor, RfcommConnector};
 use aggligator_transport_usb::{upc, usb_gadget};
 
 const TCP_PORT: u16 = 5800;
-const KCP_DEFAULT_PORT: u16 = 5801;
+const UDP_DEFAULT_PORT: u16 = 5802;
+const UDP_DEFAULT_PAYLOAD_SIZE: usize = 1180;
+const UDP_RELAY_BUFFER_SIZE: usize = 65_535;
+const UDP_RELAY_QUEUE_SIZE: usize = 512;
+const UDP_RELAY_IDLE_TIMEOUT_SECS: u64 = 120;
 const FLUSH_DELAY: Option<Duration> = Some(Duration::from_millis(10));
 const DUMP_BUFFER: usize = 8192;
 
@@ -85,6 +92,8 @@ enum Commands {
     Client(ClientCli),
     /// Tunnel server.
     Server(ServerCli),
+    /// Relay UDP datagrams to another UDP address.
+    UdpRelay(UdpRelayCli),
     /// Shows the default configuration.
     ShowCfg,
     /// Generate manual pages for this tool in current directory.
@@ -106,6 +115,7 @@ async fn main() -> Result<()> {
     let res = match cli.command {
         Commands::Client(client) => client.run(cfg, dump).await,
         Commands::Server(server) => server.run(cfg, dump).await,
+        Commands::UdpRelay(relay) => relay.run().await,
         Commands::ShowCfg => {
             print_default_cfg();
             Ok(())
@@ -153,25 +163,17 @@ pub struct ClientCli {
     /// TCP server name or IP addresses and port number.
     #[arg(long)]
     tcp: Vec<String>,
-    /// KCP server address (host:port or IP:port).
+    /// UDP server address (host:port or IP:port).
     #[arg(long)]
-    kcp: Vec<String>,
-    /// Enable FEC (Forward Error Correction) for KCP with format "data:parity".
+    udp: Vec<String>,
+    /// Maximum aggligator data payload size when UDP links are enabled.
     ///
-    /// For example, "3:1" means 3 data shards and 1 parity shard per FEC block.
-    /// This adds ~33% bandwidth overhead but can recover 1 lost packet per block
-    /// without retransmission.
-    #[cfg(feature = "fec")]
-    #[arg(long, value_parser = parse_fec_config)]
-    kcp_fec: Option<aggligator_transport_kcp::fec::FecConfig>,
-    /// Enable Phantun fake-TCP disguise for KCP traffic.
-    ///
-    /// Wraps KCP/UDP datagrams in fake TCP headers using a TUN interface,
-    /// allowing traffic to traverse firewalls that block UDP.
-    /// Requires root/admin privileges to create TUN interfaces.
-    #[cfg(feature = "phantun")]
-    #[arg(long)]
-    kcp_phantun: bool,
+    /// The default is conservative for IPv6 minimum MTU and avoids IP fragmentation.
+    #[arg(long, default_value_t = UDP_DEFAULT_PAYLOAD_SIZE)]
+    udp_payload_size: usize,
+    /// Aggregate mode: bandwidth, bandwidth-redundant, or low-latency.
+    #[arg(long, value_parser = parse_agg_mode, default_value = "bandwidth")]
+    agg_mode: AggMode,
     /// TCP link filter.
     ///
     /// none: no link filtering.
@@ -181,15 +183,18 @@ pub struct ClientCli {
     /// interface-ip: one link for each pair of local interface and remote IP address.
     #[arg(long, value_parser = parse_tcp_link_filter, default_value = "interface-interface")]
     tcp_link_filter: TcpLinkFilter,
-    /// KCP link filter.
+    /// UDP link filter.
     ///
     /// none: no link filtering.
     ///
     /// interface-interface: one link for each pair of local and remote interface.
     ///
     /// interface-ip: one link for each pair of local interface and remote IP address.
-    #[arg(long, value_parser = parse_kcp_link_filter, default_value = "interface-interface")]
-    kcp_link_filter: KcpLinkFilter,
+    #[arg(long, value_parser = parse_udp_link_filter, default_value = "interface-interface")]
+    udp_link_filter: UdpLinkFilter,
+    /// Use the system route for UDP instead of creating one UDP link per local interface.
+    #[arg(long)]
+    udp_single_interface: bool,
     /// Bluetooth RFCOMM server address.
     #[cfg(feature = "bluer")]
     #[arg(long)]
@@ -207,9 +212,13 @@ pub struct ClientCli {
 }
 
 impl ClientCli {
-    async fn run(self, cfg: Cfg, dump: Option<PathBuf>) -> Result<()> {
+    async fn run(self, mut cfg: Cfg, dump: Option<PathBuf>) -> Result<()> {
         let no_monitor = self.no_monitor || !stdout().is_tty();
         let once = self.once;
+        cfg.agg_mode = self.agg_mode;
+        if !self.udp.is_empty() {
+            constrain_udp_packet_size(&mut cfg, self.udp_payload_size)?;
+        }
 
         let ports: Vec<_> =
             self.port.clone().into_iter().map(|(s, c)| if s == 0 { (c, c) } else { (s, c) }).collect();
@@ -235,32 +244,23 @@ impl ClientCli {
             None
         };
 
-        let kcp_connector = if !self.kcp.is_empty() {
-            let kcp_config = KcpConfig::new().fast_mode().stream_mode(true).keep_alive(None);
-            match KcpConnector::new(self.kcp.clone(), KCP_DEFAULT_PORT, kcp_config).await {
-                Ok(kcp) => {
-                    let mut kcp = kcp;
-                    kcp.set_ip_version(
-                        aggligator_transport_kcp::IpVersion::from_only(self.ipv4, self.ipv6)
+        let udp_connector = if !self.udp.is_empty() {
+            match UdpConnector::new(self.udp.clone(), UDP_DEFAULT_PORT).await {
+                Ok(mut udp) => {
+                    if self.udp_single_interface {
+                        udp.set_multi_interface(false);
+                    }
+                    udp.set_ip_version(
+                        aggligator_transport_udp::IpVersion::from_only(self.ipv4, self.ipv6)
                             .map_err(|e| anyhow::anyhow!(e))?,
                     );
-                    kcp.set_link_filter(self.kcp_link_filter);
-                    #[cfg(feature = "fec")]
-                    if let Some(fec_cfg) = self.kcp_fec.clone() {
-                        kcp.set_fec(fec_cfg);
-                    }
-                    #[cfg(feature = "phantun")]
-                    if self.kcp_phantun {
-                        kcp.set_phantun(
-                            aggligator_transport_kcp::phantun::PhantunConfig::client_default(),
-                        )?;
-                    }
-                    targets.push(format!("KCP {kcp}"));
-                    watch_conn.push(Box::new(kcp.clone()));
-                    Some(kcp)
+                    udp.set_link_filter(self.udp_link_filter);
+                    targets.push(format!("UDP {udp}"));
+                    watch_conn.push(Box::new(udp.clone()));
+                    Some(udp)
                 }
                 Err(err) => {
-                    eprintln!("cannot use KCP target: {err}");
+                    eprintln!("cannot use UDP target: {err}");
                     None
                 }
             }
@@ -359,7 +359,7 @@ impl ClientCli {
             let disabled_tags_rx = disabled_tags_rx.clone();
             let port_cfg = cfg.clone();
             let tcp_connector = tcp_connector.clone();
-            let kcp_connector = kcp_connector.clone();
+            let udp_connector = udp_connector.clone();
             #[cfg(feature = "bluer")]
             let rfcomm_connector = rfcomm_connector.clone();
             #[cfg(feature = "usb-host")]
@@ -383,7 +383,7 @@ impl ClientCli {
                     if let Some(c) = tcp_connector.clone() {
                         connector.add(c);
                     }
-                    if let Some(c) = kcp_connector.clone() {
+                    if let Some(c) = udp_connector.clone() {
                         connector.add(c);
                     }
                     #[cfg(feature = "bluer")]
@@ -485,6 +485,120 @@ impl ClientCli {
 }
 
 #[derive(Parser)]
+pub struct UdpRelayCli {
+    /// UDP address to listen on.
+    #[arg(long)]
+    listen: SocketAddr,
+    /// UDP address to forward datagrams to.
+    #[arg(long)]
+    target: SocketAddr,
+    /// Close idle client mappings after this many seconds.
+    #[arg(long, default_value_t = UDP_RELAY_IDLE_TIMEOUT_SECS)]
+    client_timeout_secs: u64,
+}
+
+impl UdpRelayCli {
+    async fn run(self) -> Result<()> {
+        let listener = Arc::new(
+            UdpSocket::bind(self.listen)
+                .await
+                .with_context(|| format!("cannot bind UDP relay listener {}", self.listen))?,
+        );
+        let idle_timeout = Duration::from_secs(self.client_timeout_secs);
+        let listen_addr = listener.local_addr()?;
+        let mut clients = HashMap::<SocketAddr, mpsc::Sender<Vec<u8>>>::new();
+        let (cleanup_tx, mut cleanup_rx) = mpsc::unbounded_channel();
+        let mut buf = vec![0u8; UDP_RELAY_BUFFER_SIZE];
+
+        eprintln!("Relaying UDP {listen_addr} -> {}", self.target);
+
+        loop {
+            select! {
+                recv = listener.recv_from(&mut buf) => {
+                    let (len, client) = recv?;
+                    if !clients.contains_key(&client) {
+                        let tx = spawn_udp_relay_session(
+                            listener.clone(),
+                            client,
+                            self.target,
+                            idle_timeout,
+                            cleanup_tx.clone(),
+                        )
+                        .await?;
+                        clients.insert(client, tx);
+                    }
+
+                    let Some(tx) = clients.get(&client).cloned() else { continue };
+                    if tx.send(buf[..len].to_vec()).await.is_err() {
+                        clients.remove(&client);
+                    }
+                }
+                Some(client) = cleanup_rx.recv() => {
+                    clients.remove(&client);
+                }
+                () = wait_sigterm() => break,
+            }
+        }
+
+        Ok(())
+    }
+}
+
+async fn spawn_udp_relay_session(
+    listener: Arc<UdpSocket>, client: SocketAddr, target: SocketAddr, idle_timeout: Duration,
+    cleanup_tx: mpsc::UnboundedSender<SocketAddr>,
+) -> Result<mpsc::Sender<Vec<u8>>> {
+    let bind_addr = if target.is_ipv4() {
+        SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0)
+    } else {
+        SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0)
+    };
+    let upstream = UdpSocket::bind(bind_addr)
+        .await
+        .with_context(|| format!("cannot bind UDP relay upstream socket for {target}"))?;
+    upstream
+        .connect(target)
+        .await
+        .with_context(|| format!("cannot connect UDP relay upstream socket to {target}"))?;
+
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(UDP_RELAY_QUEUE_SIZE);
+    exec::spawn(async move {
+        let mut buf = vec![0u8; UDP_RELAY_BUFFER_SIZE];
+
+        loop {
+            select! {
+                maybe_datagram = rx.recv() => {
+                    let Some(datagram) = maybe_datagram else { break };
+                    if let Err(err) = upstream.send(&datagram).await {
+                        eprintln!("UDP relay send to {target} for {client} failed: {err}");
+                        break;
+                    }
+                }
+                recv = upstream.recv(&mut buf) => {
+                    match recv {
+                        Ok(len) => {
+                            if let Err(err) = listener.send_to(&buf[..len], client).await {
+                                eprintln!("UDP relay send to {client} from {target} failed: {err}");
+                                break;
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!("UDP relay recv from {target} for {client} failed: {err}");
+                            break;
+                        }
+                    }
+                }
+                () = sleep(idle_timeout) => break,
+            }
+        }
+
+        let _ = cleanup_tx.send(client);
+    });
+
+    Ok(tx)
+}
+
+#[derive(Parser)]
 pub struct ServerCli {
     /// Do not display the link monitor.
     #[arg(long, short = 'n')]
@@ -499,27 +613,20 @@ pub struct ServerCli {
     /// TCP port to listen on.
     #[arg(long)]
     tcp: Option<u16>,
-    /// KCP address(es) to listen on. Can be specified multiple times.
+    /// UDP address(es) to listen on. Can be specified multiple times.
     ///
     /// Takes the form `port` or `address:port`. If only a port is specified,
-    /// listens on all interfaces (both IPv4 and IPv6).
+    /// listens on all local interface addresses.
     #[arg(long)]
-    kcp: Vec<String>,
-    /// Enable FEC (Forward Error Correction) for KCP with format "data:parity".
+    udp: Vec<String>,
+    /// Maximum aggligator data payload size when UDP links are enabled.
     ///
-    /// For example, "3:1" means 3 data shards and 1 parity shard per FEC block.
-    /// Must match the client's FEC configuration.
-    #[cfg(feature = "fec")]
-    #[arg(long, value_parser = parse_fec_config)]
-    kcp_fec: Option<aggligator_transport_kcp::fec::FecConfig>,
-    /// Enable Phantun fake-TCP disguise for KCP traffic.
-    ///
-    /// Listens for incoming fake-TCP connections through a TUN interface
-    /// instead of a UDP socket. Requires root/admin privileges to create
-    /// TUN interfaces.
-    #[cfg(feature = "phantun")]
-    #[arg(long)]
-    kcp_phantun: bool,
+    /// The default is conservative for IPv6 minimum MTU and avoids IP fragmentation.
+    #[arg(long, default_value_t = UDP_DEFAULT_PAYLOAD_SIZE)]
+    udp_payload_size: usize,
+    /// Aggregate mode: bandwidth, bandwidth-redundant, or low-latency.
+    #[arg(long, value_parser = parse_agg_mode, default_value = "bandwidth")]
+    agg_mode: AggMode,
     /// RFCOMM channel number to listen on.
     #[cfg(feature = "bluer")]
     #[arg(long)]
@@ -535,8 +642,12 @@ pub struct ServerCli {
 }
 
 impl ServerCli {
-    async fn run(self, cfg: Cfg, dump: Option<PathBuf>) -> Result<()> {
+    async fn run(self, mut cfg: Cfg, dump: Option<PathBuf>) -> Result<()> {
         let no_monitor = self.no_monitor || !stdout().is_tty();
+        cfg.agg_mode = self.agg_mode;
+        if !self.udp.is_empty() {
+            constrain_udp_packet_size(&mut cfg, self.udp_payload_size)?;
+        }
 
         let ports: Arc<HashMap<_, _>> = Arc::new(
             self.port
@@ -575,67 +686,20 @@ impl ServerCli {
             }
         }
 
-        for kcp_entry in &self.kcp {
-            let kcp_config = KcpConfig::new().fast_mode().stream_mode(true).keep_alive(None);
-            let mut kcp_bound = false;
-
-            let make_acceptor = |bind_addr: SocketAddr| {
-                let mut acc = KcpAcceptor::new(bind_addr, kcp_config.clone());
-                #[cfg(feature = "fec")]
-                if let Some(fec_cfg) = &self.kcp_fec {
-                    acc.set_fec(fec_cfg.clone());
-                }
-                #[cfg(feature = "phantun")]
-                if self.kcp_phantun {
-                    acc.set_phantun(
-                        aggligator_transport_kcp::phantun::PhantunConfig::server_default(),
-                    );
-                }
-                let _ = &mut acc;
-                acc
-            };
-
-            // Parse entry as either "port" or "address:port".
-            if let Ok(addr) = kcp_entry.parse::<SocketAddr>() {
-                // Explicit address:port — bind to that specific address.
-                match tokio::net::UdpSocket::bind(addr).await {
-                    Ok(_) => {
-                        acceptor.add(make_acceptor(addr));
-                        kcp_bound = true;
+        for udp_entry in &self.udp {
+            if let Ok(addr) = udp_entry.parse::<SocketAddr>() {
+                acceptor.add(UdpAcceptor::new(addr));
+                server_ports.push(format!("UDP {addr}"));
+            } else if let Ok(port) = udp_entry.parse::<u16>() {
+                match UdpAcceptor::all_interfaces(port) {
+                    Ok(udp) => {
+                        acceptor.add(udp);
+                        server_ports.push(format!("UDP all interfaces:{port}"));
                     }
-                    Err(err) => eprintln!("Cannot listen on KCP {addr}: {err}"),
-                }
-            } else if let Ok(port) = kcp_entry.parse::<u16>() {
-                // Port only — bind on all interfaces (IPv6 + IPv4).
-                let bind_v6 = SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), port);
-                match tokio::net::UdpSocket::bind(bind_v6).await {
-                    Ok(_) => {
-                        acceptor.add(make_acceptor(bind_v6));
-                        kcp_bound = true;
-                    }
-                    Err(err) => tracing::warn!("Cannot bind KCP on {bind_v6}: {err}"),
-                }
-
-                // Bind IPv4 (needed on macOS where IPv6 socket does not accept IPv4).
-                let bind_v4 = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port);
-                match tokio::net::UdpSocket::bind(bind_v4).await {
-                    Ok(_) => {
-                        acceptor.add(make_acceptor(bind_v4));
-                        kcp_bound = true;
-                    }
-                    // On Linux dual-stack, IPv4 bind may fail since IPv6 already covers it.
-                    Err(_) if kcp_bound => {}
-                    Err(err) => eprintln!("Cannot listen on KCP port {port}: {err}"),
+                    Err(err) => eprintln!("Cannot listen on UDP port {port}: {err}"),
                 }
             } else {
-                eprintln!("Invalid KCP listen address: {kcp_entry} (expected port or address:port)");
-                continue;
-            }
-
-            if kcp_bound {
-                server_ports.push(format!("KCP {kcp_entry}"));
-            } else {
-                eprintln!("Cannot listen on KCP {kcp_entry}");
+                eprintln!("Invalid UDP listen address: {udp_entry} (expected port or address:port)");
             }
         }
 
@@ -846,21 +910,30 @@ where
     }
 }
 
-/// Parse FEC configuration from "data:parity" string (e.g. "3:1").
-#[cfg(feature = "fec")]
-fn parse_fec_config(
-    s: &str,
-) -> std::result::Result<aggligator_transport_kcp::fec::FecConfig, Box<dyn std::error::Error + Send + Sync + 'static>>
-{
-    let (data_str, parity_str) =
-        s.split_once(':').ok_or("expected format 'data:parity' (e.g. '3:1')")?;
-    let data: usize = data_str.parse().map_err(|_| "invalid data_shards number")?;
-    let parity: usize = parity_str.parse().map_err(|_| "invalid parity_shards number")?;
-    if data == 0 {
-        return Err("data_shards must be > 0".into());
+fn parse_agg_mode(s: &str) -> Result<AggMode> {
+    match s {
+        "bandwidth" => Ok(AggMode::Bandwidth),
+        "bandwidth-redundant" | "bandwidth_redundant" | "kcp-bandwidth" | "kcp_bandwidth" => {
+            Ok(AggMode::BandwidthRedundant)
+        }
+        "low-latency" | "low_latency" => Ok(AggMode::LowLatency),
+        other => bail!("unknown aggregate mode: {other}"),
     }
-    if parity == 0 {
-        return Err("parity_shards must be > 0".into());
+}
+
+fn constrain_udp_packet_size(cfg: &mut Cfg, udp_payload_size: usize) -> Result<()> {
+    let Some(udp_payload_size) = NonZeroUsize::new(udp_payload_size) else {
+        bail!("UDP payload size must be greater than zero");
+    };
+
+    let limited = cfg.io_write_size.min(udp_payload_size);
+    if limited != cfg.io_write_size {
+        tracing::info!(
+            from = cfg.io_write_size.get(),
+            to = limited.get(),
+            "reducing aggligator packet size for UDP transport"
+        );
+        cfg.io_write_size = limited;
     }
-    Ok(aggligator_transport_kcp::fec::FecConfig::new(data, parity))
+    Ok(())
 }

@@ -13,8 +13,8 @@ use std::path::PathBuf;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use aggligator::cfg::Cfg;
-use aggligator_transport_kcp::KcpLinkFilter;
 use aggligator_transport_tcp::TcpLinkFilter;
+use aggligator_transport_udp::UdpLinkFilter;
 
 /// Initializes logging for command line utilities.
 pub fn init_log() {
@@ -49,13 +49,13 @@ pub fn parse_tcp_link_filter(s: &str) -> anyhow::Result<TcpLinkFilter> {
     }
 }
 
-/// Parse [KcpLinkFilter] option.
-pub fn parse_kcp_link_filter(s: &str) -> anyhow::Result<KcpLinkFilter> {
+/// Parse [UdpLinkFilter] option.
+pub fn parse_udp_link_filter(s: &str) -> anyhow::Result<UdpLinkFilter> {
     match s {
-        "none" => Ok(KcpLinkFilter::None),
-        "interface-interface" => Ok(KcpLinkFilter::InterfaceInterface),
-        "interface-ip" => Ok(KcpLinkFilter::InterfaceIp),
-        other => bail!("unknown KCP link filter: {other}"),
+        "none" => Ok(UdpLinkFilter::None),
+        "interface-interface" => Ok(UdpLinkFilter::InterfaceInterface),
+        "interface-ip" => Ok(UdpLinkFilter::InterfaceIp),
+        other => bail!("unknown UDP link filter: {other}"),
     }
 }
 
